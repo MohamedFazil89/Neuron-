@@ -1,0 +1,3 @@
+[submodule "neuron-hub"]
+	path = neuron-hub
+	url = https://github.com/MohamedFazil89/neuron-hub.git
