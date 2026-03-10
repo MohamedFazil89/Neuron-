@@ -22,17 +22,22 @@ from neuron_feature import (
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# We use Bearer token auth (not cookies), so credentials=False is fine.
+# Wildcard origin lets any localhost port work — Vite defaults to 5173,
+# but projects may also use 3000, 4173, 8080, etc.
+# NOTE: supports_credentials MUST be False when origins="*".
 CORS(
     app,
-    origins=["http://localhost:8080"],
-    supports_credentials=True,
+    origins="*",
+    supports_credentials=False,
     allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # In-memory Agent Store  (per-user)
 # ─────────────────────────────────────────────────────────────────────────────
-# Structure: { user_id: { "architect": {...}, "backend": {...}, ... } }
 _USER_AGENTS: dict[str, dict] = {}
 
 def _default_agents() -> dict:
@@ -84,10 +89,10 @@ def log_activity(user_id: str, agent_id: str, message: str, event_type="status",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Project / Task state  (per-user)
+# Project / Task state  (per-user, thread-safe)
 # ─────────────────────────────────────────────────────────────────────────────
-# Structure: { user_id: { project: {...} | None, task: {...} | None } }
 _USER_STATE: dict[str, dict] = {}
+_STATE_LOCK = threading.Lock()
 
 def get_state_for(user_id: str) -> dict:
     if user_id not in _USER_STATE:
@@ -95,16 +100,20 @@ def get_state_for(user_id: str) -> dict:
     return _USER_STATE[user_id]
 
 def set_project(user_id: str, project):
-    get_state_for(user_id)["project"] = project
+    with _STATE_LOCK:
+        get_state_for(user_id)["project"] = project
 
 def set_task(user_id: str, task):
-    get_state_for(user_id)["task"] = task
+    with _STATE_LOCK:
+        get_state_for(user_id)["task"] = task
 
 def get_project_for(user_id: str):
-    return get_state_for(user_id)["project"]
+    with _STATE_LOCK:
+        return get_state_for(user_id).get("project")
 
 def get_task_for(user_id: str):
-    return get_state_for(user_id)["task"]
+    with _STATE_LOCK:
+        return get_state_for(user_id).get("task")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,22 +122,19 @@ def get_task_for(user_id: str):
 def simulate_agent_metrics(user_id: str):
     for agent in get_agents_for(user_id).values():
         if agent["enabled"] and agent["status"] == "working":
-            agent["tokenUsage"]       += random.randint(20, 100)
-            agent["lastResponseTime"]  = round(random.uniform(0.3, 1.8), 2)
+            agent["tokenUsage"]      += random.randint(20, 100)
+            agent["lastResponseTime"] = round(random.uniform(0.3, 1.8), 2)
 
 @app.before_request
 def before():
-    # Only simulate metrics on authenticated agent polling requests
+    if request.method == "OPTIONS":
+        return  # CORS preflight — handled by flask-cors
     if request.path.startswith("/agents") and request.method == "GET":
         uid = _peek_user_id()
         if uid:
             simulate_agent_metrics(uid)
 
 def _peek_user_id() -> str | None:
-    """
-    Extract user_id from the JWT without aborting — used in before_request
-    where we can't return 401 easily.
-    """
     try:
         from auth import verify_token
         auth_header = request.headers.get("Authorization", "")
@@ -158,7 +164,6 @@ def get_agents():
     agents = get_agents_for(uid)
     return jsonify({"count": len(agents), "agents": list(agents.values())})
 
-
 @app.route("/agents/<agent_id>", methods=["GET"])
 @require_auth
 def get_agent(agent_id):
@@ -167,7 +172,6 @@ def get_agent(agent_id):
     if not agent:
         abort(404)
     return jsonify(agent)
-
 
 @app.route("/agents/<agent_id>/start", methods=["POST"])
 @require_auth
@@ -182,7 +186,6 @@ def start_agent(agent_id):
     log_activity(uid, agent_id, "Agent started")
     return jsonify({"success": True, "status": agent["status"]})
 
-
 @app.route("/agents/<agent_id>/stop", methods=["POST"])
 @require_auth
 def stop_agent(agent_id):
@@ -196,7 +199,6 @@ def stop_agent(agent_id):
     log_activity(uid, agent_id, "Agent stopped")
     return jsonify({"success": True, "status": agent["status"]})
 
-
 @app.route("/agents/<agent_id>/pause", methods=["POST"])
 @require_auth
 def pause_agent(agent_id):
@@ -208,7 +210,6 @@ def pause_agent(agent_id):
     agent["currentAction"] = "Paused"
     log_activity(uid, agent_id, "Agent paused")
     return jsonify({"success": True, "status": agent["status"]})
-
 
 @app.route("/agents/activity", methods=["GET"])
 @require_auth
@@ -247,13 +248,11 @@ def load_project():
     print(f"✅ [{uid[:8]}] Project loaded: {project_name}")
     return jsonify({"success": True, "project": project})
 
-
 @app.route("/project", methods=["GET"])
 @require_auth
 def get_project():
     uid     = current_user_id()
     project = get_project_for(uid)
-    print(f"PROJECT STATE [{uid[:8]}]:", project)
     return jsonify({
         "project": project,
         "metrics": {
@@ -273,24 +272,20 @@ def task_start():
     result = start_task(body.get("name", ""), body.get("description", ""))
     return jsonify(result)
 
-
 @app.route("/task/pause", methods=["POST"])
 @require_auth
 def task_pause():
     return jsonify(pause_task())
-
 
 @app.route("/task/abort", methods=["POST"])
 @require_auth
 def task_abort():
     return jsonify(abort_task())
 
-
 @app.route("/task/retry", methods=["POST"])
 @require_auth
 def task_retry():
     return jsonify(retry_task())
-
 
 @app.route("/task/current", methods=["GET"])
 @require_auth
@@ -303,25 +298,6 @@ def get_current_task():
 # CLI — init
 # ─────────────────────────────────────────────────────────────────────────────
 IGNORE_FOLDERS = {"node_modules", ".git", "venv", "__pycache__"}
-
-
-def scan_project(path):
-    total_files = total_folders = total_size = 0
-    languages   = {}
-    for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in IGNORE_FOLDERS]
-        total_folders += len(dirs)
-        for file in files:
-            total_files += 1
-            total_size  += os.path.getsize(os.path.join(root, file))
-            ext          = file.rsplit(".", 1)[-1].lower()
-            languages[ext] = languages.get(ext, 0) + 1
-    return {
-        "totalFiles": total_files, "totalFolders": total_folders,
-        "totalSizeMB": round(total_size / (1024 * 1024), 2),
-        "languages": languages,
-    }
-
 
 def process_init_task(user_id: str, path: str, task: dict):
     try:
@@ -344,6 +320,10 @@ def process_init_task(user_id: str, path: str, task: dict):
                     task["timeElapsed"]  = int(time.time() - start_time)
                     time.sleep(0.1)
 
+        task["status"]       = "completed"
+        task["timeElapsed"]  = int(time.time() - start_time)
+        task["filesTouched"] = files_list[:20]
+
         project = {
             "id":            "1",
             "name":          os.path.basename(path),
@@ -356,19 +336,13 @@ def process_init_task(user_id: str, path: str, task: dict):
             "totalFiles":    total_files,
         }
 
-        task["status"]      = "completed"
-        task["timeElapsed"] = int(time.time() - start_time)
-        project["activeTask"] = task
-
-        # Write state scoped to this user only
         set_project(user_id, project)
         set_task(user_id, task)
-
-        print(f"✅ [{user_id[:8]}] PROJECT SET: {project['name']}")
+        print(f"✅ [{user_id[:8]}] PROJECT SET: {project['name']} ({total_files} files)")
 
     except Exception as e:
         print(f"❌ [{user_id[:8]}] THREAD CRASHED: {e}")
-
+        import traceback; traceback.print_exc()
 
 @app.route("/cli/init", methods=["POST"])
 @require_auth
@@ -376,7 +350,7 @@ def cli_init():
     uid  = current_user_id()
     data = request.get_json() or {}
     path = data.get("path")
-    print(f"🔥 [{uid[:8]}] BACKEND RECEIVED /cli/init")
+    print(f"🔥 [{uid[:8]}] BACKEND RECEIVED /cli/init path={path}")
 
     if not path or not os.path.exists(path):
         return jsonify({"error": "Invalid project path"}), 400
@@ -418,7 +392,6 @@ def _scaffold_wrapper(user_id: str, project_path: str, prompt: str, task: dict):
             project["activeTask"] = task
             set_project(user_id, project)
         set_task(user_id, task)
-
 
 @app.route("/cli/scaffold", methods=["POST"])
 @require_auth
@@ -482,9 +455,7 @@ def cli_create():
         return jsonify({"error": "backend must be 'python' or 'nodejs'"}), 400
 
     try:
-        print(f"[create] [{uid[:8]}] cwd='{cwd}' -> {os.path.join(cwd or '.', project_name)}")
         result = run_create_project(project_name, backend, database, cwd)
-
         project = {
             "id":            "1",
             "name":          project_name,
@@ -507,10 +478,7 @@ def cli_create():
             "totalFiles":   len(result["files_created"]),
         }
         set_project(uid, project)
-
-        print(f"[create] [{uid[:8]}] Project registered: {project_name}")
         return jsonify(result)
-
     except FileExistsError as e:
         return jsonify({"error": str(e)}), 409
     except Exception as e:
@@ -542,8 +510,8 @@ def get_logs():
     if task and task.get("logs"):
         for i, msg in enumerate(task["logs"]):
             severity = (
-                "error"   if "error"   in msg.lower() or "failed"   in msg.lower() else
-                "warning" if "warn"    in msg.lower() or "fallback" in msg.lower() else
+                "error"   if "error"  in msg.lower() or "failed"   in msg.lower() else
+                "warning" if "warn"   in msg.lower() or "fallback" in msg.lower() else
                 "info"
             )
             unified.append({
